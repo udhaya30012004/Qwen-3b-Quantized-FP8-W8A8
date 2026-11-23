@@ -1,0 +1,35 @@
+{
+  "repo_id": "UchihaUdhaya/Qwen2.5-3B-FP8-W8A8-Dynamic",
+  "private": false,
+  "commit_message": "Upload Qwen2.5-3B FP8 W8A8 Per-Channel (FP8_DYNAMIC) PTQ checkpoint",
+  "modal": {
+    "app_name": "quantt-fp8-hf-upload",
+    "volume_name": "quant-models",
+    "volume_mount": "/vol",
+    "remote_model_dir": "/vol/models/qwen2.5-3b-w8a8-pc"
+  },
+  "required_files": [
+    "model.safetensors",
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja"
+  ],
+  "allow_patterns": [
+    "model.safetensors",
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "recipe.yaml"
+  ],
+  "ignore_patterns": [
+    "size_report.json",
+    "*.tmp",
+    "*.lock",
+    "__pycache__/*",
+    ".cache/*"
+  ]
+}
