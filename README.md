@@ -1,137 +1,156 @@
-# Qwen2.5-3B FP8 Post-Training Quantization (PTQ) Study
+# FP8 Post-Training Quantization Study
 
-[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Qwen2.5--3B--FP8--W8A8--Dynamic-yellow)](https://huggingface.co/UchihaUdhaya/Qwen2.5-3B-FP8-W8A8-Dynamic)
-[![Base Model](https://img.shields.io/badge/Base%20Model-Qwen%2FQwen2.5--3B-blue)](https://huggingface.co/Qwen/Qwen2.5-3B)
-[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![GPU](https://img.shields.io/badge/Evaluated%20On-NVIDIA%20L4%20(Ada)-76B900)](https://www.nvidia.com/en-us/data-center/l4/)
+Evaluation of FP8 post-training quantization (PTQ) for **Qwen2.5-3B** on an **NVIDIA L4 (24 GB, Ada, compute capability 8.9)**. The study compares model quality, probability-distribution fidelity, checkpoint size, and serving performance against a BF16 baseline.
 
-A rigorous, end-to-end **Post-Training Quantization (PTQ)** benchmark evaluating **5 FP8 E4M3 quantization recipes** on [`Qwen/Qwen2.5-3B`](https://huggingface.co/Qwen/Qwen2.5-3B) using **real `vLLM` serving on an NVIDIA L4 (24 GB Ada Lovelace)** GPU — with **zero fine-tuning, zero LoRA, and zero gradients**.
+> **Scope:** inference-only PTQ. No fine-tuning, quantization-aware training, or gradient updates were used.
 
-> **Published Quantized Weights:** Download directly from Hugging Face → **[`UchihaUdhaya/Qwen2.5-3B-FP8-W8A8-Dynamic`](https://huggingface.co/UchihaUdhaya/Qwen2.5-3B-FP8-W8A8-Dynamic)**  
-> *(Model weights are hosted on Hugging Face; this repository contains all quantization scripts, evaluation harnesses, statistical analyses, and benchmark plots.)*
+## Key findings
 
----
+- FP8 checkpoints are about **45% smaller** than BF16: 6.17 GB to 3.40 GB, freeing roughly 2.6 GiB of GPU memory for serving.
+- **W8A16 per-channel (`w8a16_pc`)** is the preferred low-batch, latency-sensitive option: 14.7 ms/token TPOT at batch 1 versus 25.5 ms/token for BF16, with 69.09% average zero-shot accuracy versus 68.89% for BF16.
+- **W8A8 per-channel (`w8a8_pc`, dynamic per-token activations)** is the preferred high-batch option: up to 3,374 output tokens/s at batch 128 with 128-token prompts (about 35% above BF16), and 1,613 tokens/s with 512-token prompts (about 32% above BF16).
+- W8A8 increases distribution shift compared with W8A16, so deployment choice depends on whether throughput or fidelity/latency is more important.
+- Static per-tensor W8A8 is not recommended for this setup: it requires calibration, has the largest reported KL shift, and offers little serving gain over dynamic per-channel W8A8.
 
-## Key Findings (TL;DR)
+These are measurements for the model, hardware, software versions, and workloads described here; they should not be assumed to generalize to other GPUs or serving stacks.
 
-1. **45% Smaller Footprint (`6.17 GB → 3.40 GB`):** All 5 FP8 recipes compress weights identically across all 252 Linear layers, freeing `~2.6 GiB` VRAM for KV cache.
-2. **Zero Downstream Accuracy Loss:** Across **`16,695` zero-shot questions** (HellaSwag, ARC-Easy, ARC-Challenge, WinoGrande, PIQA), both `w8a16_pc` (`69.09%`) and `w8a8_pc` (`69.01%`) match the BF16 baseline (`68.89%`) with **zero statistically significant drops** (exact paired McNemar test).
-3. **Clear L4 Hardware Crossover (Workload-Based Deployment Rule):**
-   - **Low-Batch / Interactive (`B ≤ 32`):** **`w8a16_pc`** (Marlin weight-only kernel) wins decisively with **1.74× faster decode** (`14.66 ms/tok` vs `25.55 ms/tok`) and best distribution fidelity (`96.9%` UltraChat top-1 agreement).
-   - **High-Concurrency / Long Prompts (`B = 128`, `in = 512`):** **`w8a8_pc`** (native Ada FP8 Tensor Cores) wins with **+35% peak throughput** (`3,374 tok/s`) and **1.34× faster prefill** (`5.78s` vs `7.72s`), whereas `w8a16` drops to `0%` throughput gain on long prompts.
-   - **Avoid `w8a8_pt_static`:** Requires calibration, suffers `+45%` worse KL divergence due to SwiGLU `down_proj` activation outliers (`1.58 × 10⁷×` max/median in Layer 2), and causes the only `p < 0.01` accuracy drop (HellaSwag `-0.43%`) for `<2%` extra speed.
+## Quantization paths from the BF16 baseline
 
----
+Each branch starts from the same BF16 model and produces one FP8 post-training quantization (PTQ) recipe. W8A16 keeps activations in BF16; W8A8 quantizes activations as well.
 
-## Master Scorecard (`Qwen2.5-3B` on NVIDIA L4)
+```mermaid
+flowchart LR
+    A[BF16 baseline<br/>Qwen2.5-3B] --> B[FP8 PTQ]
+    B --> C[W8A16 per-tensor<br/>FP8 weights + BF16 activations<br/>w8a16_pt]
+    B --> D[W8A16 per-channel<br/>FP8 weights + BF16 activations<br/>w8a16_pc]
+    B --> E[W8A8 per-tensor dynamic<br/>FP8 weights + dynamic FP8 activations<br/>w8a8_pt_dyn]
+    B --> F[W8A8 per-tensor static<br/>FP8 weights + calibrated static FP8 activations<br/>w8a8_pt_static]
+    B --> G[W8A8 per-channel dynamic<br/>FP8 weights + dynamic per-token FP8 activations<br/>w8a8_pc]
+```
 
-| Method | Size (Saved) | 5-Task Avg Acc | WikiText PPL (Δ) | Mean KL (Wiki) | B=1 Decode (TPOT) | B=128 Throughput (`in=128` / `512`) | Recommendation |
-|---|---:|---:|---:|---:|---:|---:|---|
-| **BF16 (Baseline)** | `6.17 GB` (0%) | `68.89%` | `7.782` (—) | `0.0000` | `25.55 ms` | `2,504 / 1,223 tok/s` | Baseline |
-| **`w8a16_pc`** | **`3.40 GB` (-44.9%)** | **`69.09%` (ns)** | **`7.804` (+0.022)** | **`0.0058`** | **`14.66 ms` (1.74×)** | `2,860 / 1,220 tok/s` | **Ship: Low-Batch (`≤ 32`)** |
-| **`w8a16_pt`** | `3.40 GB` (-45.0%) | `69.09%` (ns) | `7.809` (+0.027) | `0.0056` | `14.66 ms` (1.74×) | `2,891 / 1,222 tok/s` | Viable alt |
-| **`w8a8_pc` (`FP8_DYNAMIC`)** | **`3.40 GB` (-44.9%)** | **`69.01%` (ns)** | **`7.834` (+0.052)** | **`0.0105`** | `16.42 ms` (1.56×) | **`3,374 / 1,613 tok/s` (1.35×)** | **Ship: High-Batch (`64–200+`)** |
-| **`w8a8_pt_dyn`** | `3.40 GB` (-45.0%) | `69.32%` (`*` HS) | `7.855` (+0.073) | `0.0114` | `16.35 ms` (1.56×) | `3,397 / 1,600 tok/s` | Dominated by `w8a8_pc` |
-| **`w8a8_pt_static`** | `3.40 GB` (-45.0%) | `69.16%` (`**` HS) | `7.866` (+0.084) | `0.0152` | `16.04 ms` (1.59×) | `3,427 / 1,615 tok/s` | **Do not deploy** |
+### Quantization recipes
 
----
+| Recipe | Weights | Activations | Scale / calibration |
+|---|---|---|---|
+| `w8a16_pt` | FP8 per-tensor | BF16 | Per-tensor; no calibration |
+| `w8a16_pc` | FP8 per-channel | BF16 | Per-channel; no calibration |
+| `w8a8_pc` | FP8 per-channel | FP8 dynamic per-token | Dynamic; no calibration (`FP8_DYNAMIC`) |
+| `w8a8_pt_dyn` | FP8 per-tensor | FP8 dynamic per-tensor | Dynamic; no calibration |
+| `w8a8_pt_static` | FP8 per-tensor | FP8 static per-tensor | Static scales; 512 calibration samples |
 
-## Visual Results
+The study quantizes the 252 Linear modules across 36 decoder blocks. Embeddings, normalization layers, and `lm_head` remain BF16. The project uses real quantized checkpoints for serving measurements and a PyTorch simulation track for distribution and layer diagnostics.
 
-### Model Size & Compression
-![Model Size and Compression](plots/01_model_size_compression.png)
+### Evaluation
 
-### Zero-Shot Downstream Accuracy (`16,695` Questions)
-![Overall Zero-Shot Accuracy](plots/02_zero_shot_accuracy.png)
+- **Zero-shot accuracy:** HellaSwag, ARC-Easy, ARC-Challenge, WinoGrande, and PIQA; 16,695 questions in total. Paired accuracy comparisons use the exact McNemar test as recorded in the project findings.
+- **Distribution fidelity:** full-vocabulary KL divergence and next-token agreement against BF16 on WikiText-2 and UltraChat. WikiText-2 perplexity/loss is also measured.
+- **Serving:** vLLM on an NVIDIA L4, across batch sizes 1, 8, 32, and 128 and prompt lengths of 128 and 512 tokens. Metrics include decode TPOT, prefill time, end-to-end latency, and output throughput.
+- **Software:** vLLM 0.34.0; the experiment plan records `llm-compressor` 0.15.0 and `lm-eval` 0.4.13.
 
-### Next-Token Distribution Fidelity (Top-1 Token Agreement)
-![Top-1 Token Agreement](plots/03_token_agreement.png)
+## Results and deployment conclusion
 
-### End-to-End Request Latency Breakdown (Prefill vs Decode)
-![End-to-End Latency Breakdown](plots/04_end_to_end_latency.png)
+For the tested NVIDIA L4 setup, use **W8A16 per-channel (`w8a16_pc`) for single-user interactive serving and batch sizes up to 32**. It has the lowest measured single-user decode latency and strong probability fidelity. For **larger batches and higher concurrent user counts, use W8A8 per-channel dynamic (`w8a8_pc`)**: at batch 128 it provides the strongest measured throughput, particularly for long prompts, using the L4's native FP8 compute. The benchmark grid tested batches 1, 8, 32, and 128, so it establishes the advantage at the tested low and high endpoints; the precise crossover between 32 and 128 was not sampled.
 
-### Serving Throughput Scaling (Batch 1 → 128 on NVIDIA L4)
-![Throughput Scaling](plots/05_throughput_scaling.png)
+The trade-off is visible in KL: W8A16 per-channel has lower mean KL than W8A8 per-channel on both WikiText-2 and UltraChat, while W8A8 buys serving throughput at high batch. The KL charts at the end compare those methods directly. Lower KL means closer next-token probability distributions to BF16; it does not by itself establish equal downstream task accuracy.
 
----
+## Selected results
 
-## Quickstart: Run the Published FP8 Model
+The figures below provide an overview of accuracy, output fidelity, storage savings, and serving performance. The three KL figures above add detailed fidelity comparisons for the two recommended recipes.
 
-### vLLM (Recommended)
+### 1. Overall zero-shot accuracy
+
+Compares the BF16 baseline with W8A16 and W8A8 using per-tensor and per-channel scaling. The plotted averages are 68.89% for BF16, 69.09% for W8A16, and 69.32% / 69.01% for the W8A8 per-tensor / per-channel results shown.
+
+![Overall zero-shot accuracy: BF16 vs W8A16 vs W8A8](accuracy_plots/accuracy_bf16_w8a16_w8a8_pt_vs_pc.png)
+
+### 2. Accuracy across all evaluated methods
+
+Use this comparison for task-level results and the full set of quantization recipes.
+
+![Accuracy across all methods](accuracy_plots/05_Accuracy_All_Methods_Comparison.png)
+
+### 3. Mean KL divergence
+
+Lower KL means the quantized model's next-token probability distribution is closer to BF16. The chart separates WikiText-2 and UltraChat results and marks the FP16 cast noise floor.
+
+![Mean KL divergence against BF16](accuracy_plots/06a_Mean_KL_Divergence.png)
+
+### 4. Top-1 token agreement
+
+Shows how often each quantized model selects the same next token as BF16 on WikiText-2 and UltraChat.
+
+![Top-1 token agreement against BF16](accuracy_plots/06b_Token_Agreement.png)
+
+### 5. Checkpoint size and compression
+
+The FP8 checkpoints are approximately 45% smaller than the BF16 baseline.
+
+![Model size and compression](accuracy_plots/09_Model_Size_and_Compression.png)
+
+### 6. End-to-end request latency
+
+Breaks request time into prefill and decode for single-user, medium-batch, and heavy-batch workloads.
+
+![End-to-end latency breakdown](time_plots/03_end_to_end_latency.png)
+
+### 7. Serving throughput scaling
+
+Compares output throughput across batch sizes for short (128-token) and long (512-token) prompts.
+
+![Serving throughput scaling](time_plots/04_throughput_scaling.png)
+
+## Repository guide
+
+| Path | Contents |
+|---|---|
+| `fp_8/` | FP8 configuration, checkpoint creation, evaluation, diagnostics, plotting, and serving benchmarks |
+| `accuracy_plots/` | Accuracy, KL, token-agreement, perplexity, and checkpoint-size figures and plotting scripts |
+| `time_plots/` | Decode, prefill, end-to-end latency, throughput figures and plotting script |
+| `results/` | Recorded evaluation outputs, summaries, manifests, and diagnostic plots |
+| `docs/findings.md` | Detailed findings, deployment recommendations, and methodological notes |
+| `plan.md` | Experiment plan and implementation notes |
+| `present.md` | Management presentation narrative and detailed scorecard |
+| `requirements.txt` | Python dependencies for the local plotting / analysis environment |
+
+## Reproducing plots
+
+From the repository root, install the dependencies in `requirements.txt`, then run the relevant plotting scripts:
+
 ```bash
-vllm serve UchihaUdhaya/Qwen2.5-3B-FP8-W8A8-Dynamic \
-  --gpu-memory-utilization 0.90 \
-  --max-model-len 4096
+python accuracy_plots/plot_accuracy.py
+python accuracy_plots/plot_pt_pc_accuracy.py
+python accuracy_plots/plot_kl_executive_summary.py
+python accuracy_plots/plot_pt_pc_kl.py
+python time_plots/plot_time.py
 ```
 
-### Hugging Face `transformers`
-```python
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+The scripts may regenerate figure files from the result data and configuration available in this checkout. Running cloud-based model evaluation or serving benchmarks requires the corresponding Modal/GPU setup and model/data access; plot generation alone does not rerun those experiments.
 
-model_id = "UchihaUdhaya/Qwen2.5-3B-FP8-W8A8-Dynamic"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", torch_dtype=torch.bfloat16)
+## Further details
 
-inputs = tokenizer("Explain FP8 quantization:", return_tensors="pt").to(model.device)
-print(tokenizer.decode(model.generate(**inputs, max_new_tokens=64)[0], skip_special_tokens=True))
-```
+- [Detailed findings and deployment guidance](docs/findings.md)
+- [FP8 accuracy plot catalogue](accuracy_plots/README.md)
+- [Presentation and full scorecard](present.md)
+- [Experiment plan](plan.md)
 
----
+## KL comparison plots
 
-## Reproducing the Full Study (Modal L4)
+The following KL figures are collected at the end for direct comparison. Lower KL indicates a next-token probability distribution closer to the BF16 reference; read it alongside downstream accuracy and serving results.
 
-```bash
-pip install -r requirements.txt
-cd fp_8
+### W8A16 per-channel vs BF16
 
-# 1. Download BF16 baseline & freeze evaluation datasets on Modal Volume
-modal run download_model.py
-modal run prepare_data.py
+Mean KL is 0.0058 nats, below the figure's 0.05 reference threshold. The summary also shows token-level KL distribution, top-1 agreement, zero-shot accuracy, checkpoint size, and batch-1 decode latency.
 
-# 2. Quantize (one-shot PTQ via llm-compressor)
-modal run quantize_fp8.py --recipe w8a8_pc
-modal run quantize_fp8.py --recipe w8a16_pc
+![W8A16 per-channel versus BF16 KL executive summary](01_kl_executive_summary_w8a16_pc_vs_bf16.png)
 
-# 3. Evaluate Perplexity, Zero-Shot Benchmarks (lm-eval), & vLLM Speed
-modal run eval_ppl_vllm.py --fmt w8a8_pc
-modal run eval_lm.py --fmt w8a8_pc
-modal run bench_speed.py --fmt w8a8_pc
+### W8A8 per-channel vs BF16
 
-# 4. Run 252-layer activation outlier diagnostics
-modal run layer_diag.py
-```
+Mean KL is 0.0105 nats. W8A8 per-channel has a larger distribution shift than W8A16 per-channel, alongside its throughput advantage at high batch.
 
----
+![W8A8 per-channel versus BF16 KL executive summary](02_kl_executive_summary_w8a8_pc_vs_bf16.png)
 
-## Repository Structure
+### Direct W8A16 vs W8A8 comparison
 
-```text
-├── README.md                 # Project overview, master scorecard & quickstart
-├── present.md                # 10-slide executive presentation deck
-├── docs/findings.md          # Complete statistical findings & hypothesis verdicts
-├── plots/                    # High-resolution evaluation plots
-├── results/
-│   ├── summary/              # Auto-generated summary.md & summary.csv
-│   ├── size_*.json           # Exact tensor/byte compression reports per recipe
-│   └── data_manifest.json    # Frozen evaluation dataset manifest
-└── fp_8/
-    ├── config.py             # Central experiment & recipe configuration
-    ├── modal_app.py          # Modal container images & volume setup
-    ├── quantize_fp8.py       # One-shot FP8 PTQ via llm-compressor
-    ├── sim_eval.py           # Track A PyTorch FP8 simulation & full-vocab KL
-    ├── validate_sim.py       # Cross-track weight RMSE & PPL consistency check
-    ├── eval_ppl_vllm.py      # Track B live vLLM perplexity evaluation
-    ├── eval_lm.py            # 5-task zero-shot lm-evaluation-harness runner
-    ├── bench_speed.py        # 8-workload vLLM latency & throughput benchmark
-    ├── layer_diag.py         # 252-layer weight SQNR & activation outlier sweep
-    ├── sanity_check.py       # 25-prompt greedy generation agreement check
-    ├── stats.py              # Paired bootstrap CIs & exact McNemar tests
-    └── hf_upload/            # Standalone Hugging Face Hub publisher
-```
+This figure compares mean KL with 95% confidence intervals and 99th-percentile tail KL on WikiText-2 and UltraChat. W8A8 per-channel has higher mean and tail KL on both datasets in these results.
 
----
-
-## License
-
-Code and documentation are released under the **Apache 2.0** license, matching [`Qwen/Qwen2.5-3B`](https://huggingface.co/Qwen/Qwen2.5-3B).
+![KL comparison: BF16, W8A16 per-channel, and W8A8 per-channel](kl_comparison_bf16_w8a16_w8a8_pc.png)
